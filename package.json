@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "description": "Standalone background bridge that mirrors ncSender machine status to a WLED controller, independent of the ncSender plugin sandbox.",
   "main": "wled-bridge.js",
+  "license": "GPL-3.0-only",
   "scripts": {
     "start": "node wled-bridge.js"
   },
