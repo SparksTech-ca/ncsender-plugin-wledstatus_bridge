@@ -22,6 +22,18 @@
  */
 
 const http = require('http');
+const path = require('path');
+
+// Read the version directly from package.json rather than hardcoding it
+// here, so there's exactly one place it can ever drift from - and it's
+// printed on every startup so you can visually confirm which version is
+// actually running (vs. a stale download sitting around).
+let BRIDGE_VERSION = 'unknown';
+try {
+  BRIDGE_VERSION = require(path.join(__dirname, 'package.json')).version || 'unknown';
+} catch (_) {
+  /* ignore - falls back to 'unknown' if package.json is missing/unreadable */
+}
 
 let WebSocketImpl;
 try {
@@ -120,7 +132,13 @@ function getAllHosts() {
   const hosts = [];
   const primary = (settings.wledHost || '').trim();
   if (primary) hosts.push(primary);
-  (settings.secondaryWledHosts || []).forEach((h) => { if (h) hosts.push(h); });
+  // Tolerate both shapes: plain host strings (older saved settings, or if
+  // this REST read races ahead of the dialog's sanitized re-save) and the
+  // newer { host, name } objects.
+  (settings.secondaryWledHosts || []).forEach((entry) => {
+    const h = entry && typeof entry === 'object' ? entry.host : entry;
+    if (h && !hosts.includes(h)) hosts.push(h);
+  });
   return hosts;
 }
 
@@ -169,33 +187,89 @@ const FALLBACK_COLORS = {
   homing: { r: 0, g: 210, b: 255 }
 };
 
+// === Job progress bar ===
+// The job progress host shows the normal status color, like a secondary
+// instance, EXCEPT while a job is actively running - then it switches to
+// a fill bar instead. jobProgressActive tracks which mode it's currently
+// in, so applyColor() knows whether to skip sending status color to it.
+
+let jobProgressActive = false;
+let lastJobProgressLit = null;
+
+function interpolateColor(c1, c2, t) {
+  return {
+    r: Math.round(c1.r + (c2.r - c1.r) * t),
+    g: Math.round(c1.g + (c2.g - c1.g) * t),
+    b: Math.round(c1.b + (c2.b - c1.b) * t)
+  };
+}
+
+function buildJobProgressSegments(progressPercent) {
+  const ledCount = Math.max(1, settings.jobProgressLedCount || 30);
+  const ratio = Math.max(0, Math.min(1, (progressPercent || 0) / 100));
+  const litCount = Math.max(0, Math.min(ledCount, Math.round(ledCount * ratio)));
+  const bg = settings.jobProgressBackgroundColor || { r: 0, g: 0, b: 0 };
+  const startColor = settings.jobProgressStartColor || { r: 255, g: 0, b: 0 };
+  const endColor = settings.jobProgressEndColor || { r: 0, g: 255, b: 0 };
+  const fillColor = settings.jobProgressFillStyle === 'solid' ? startColor : interpolateColor(startColor, endColor, ratio);
+
+  const segments = [{ id: 0, start: 0, stop: ledCount, fx: 0, col: [[bg.r, bg.g, bg.b]] }];
+  if (litCount > 0) {
+    const start = settings.jobProgressInvert ? ledCount - litCount : 0;
+    const stop = settings.jobProgressInvert ? ledCount : litCount;
+    segments.push({ id: 1, start, stop, fx: 0, col: [[fillColor.r, fillColor.g, fillColor.b]] });
+  }
+  return { segments, litCount };
+}
+
+async function applyJobProgress(progressPercent) {
+  const host = (settings.jobProgressHost || '').trim();
+  if (!host) return;
+  const { segments } = buildJobProgressSegments(progressPercent);
+  const ok = await sendToHost(host, { on: true, bri: settings.brightness ?? 255, seg: segments });
+  log('applyJobProgress', progressPercent + '%', ok ? 'ok' : 'FAILED');
+}
+
+function buildFollowerSegments(color, followerIndex) {
+  const seg = [{ fx: 0, col: [[color.r, color.g, color.b]] }];
+  if (settings.xFollowEnabled && followerIndex != null) {
+    const width = Math.max(1, settings.followerWidth || 1);
+    const ledCount = Math.max(1, settings.ledCount || 30);
+    // Center the cursor on followerIndex rather than starting there.
+    const halfWidth = Math.floor(width / 2);
+    const start = Math.max(0, Math.min(ledCount - width, followerIndex - halfWidth));
+    const stop = Math.min(ledCount, start + width);
+    const fc = settings.followerColor || { r: 255, g: 255, b: 255 };
+    seg[0].id = 0;
+    seg[0].start = 0;
+    seg[0].stop = ledCount;
+    seg.push({ id: 1, start, stop, fx: 0, col: [[fc.r, fc.g, fc.b]] });
+  }
+  return seg;
+}
+
+// Applies the current state color to every configured host. Each host's
+// treatment depends on which exclusive role (if any) it's currently
+// assigned to: the follower host gets the cursor segments, the job
+// progress host gets skipped here entirely while a job is actively
+// showing its fill bar (applyJobProgress owns it during that window),
+// and every other host just gets the plain background color.
 async function applyColor(state, followerIndex) {
   const color = (settings.colors && settings.colors[state]) || FALLBACK_COLORS[state] || { r: 255, g: 255, b: 255 };
   const brightness = settings.brightness ?? 255;
+  const followerHost = (settings.followerHost || settings.wledHost || '').trim();
+  const jobProgressHost = (settings.jobProgressHost || '').trim();
 
-  const tasks = [];
-  const primaryHost = (settings.wledHost || '').trim();
-  if (primaryHost) {
-    const seg = [{ fx: 0, col: [[color.r, color.g, color.b]] }];
-    if (settings.xFollowEnabled && followerIndex != null) {
-      const width = Math.max(1, settings.followerWidth || 1);
-      const ledCount = Math.max(1, settings.ledCount || 30);
-      // Center the cursor on followerIndex rather than starting there.
-      const halfWidth = Math.floor(width / 2);
-      const start = Math.max(0, Math.min(ledCount - width, followerIndex - halfWidth));
-      const stop = Math.min(ledCount, start + width);
-      const fc = settings.followerColor || { r: 255, g: 255, b: 255 };
-      seg[0].id = 0;
-      seg[0].start = 0;
-      seg[0].stop = ledCount;
-      seg.push({ id: 1, start, stop, fx: 0, col: [[fc.r, fc.g, fc.b]] });
+  const tasks = getAllHosts().map((host) => {
+    if (settings.xFollowEnabled && host === followerHost) {
+      return sendToHost(host, { on: true, bri: brightness, seg: buildFollowerSegments(color, followerIndex) })
+        .then((ok) => log('applyColor[follower:' + host + ']', state, followerIndex != null ? '(LED ' + followerIndex + ')' : '', ok ? 'ok' : 'FAILED'));
     }
-    tasks.push(sendToHost(primaryHost, { on: true, bri: brightness, seg }).then((ok) => log('applyColor[primary]', state, followerIndex != null ? '(LED ' + followerIndex + ')' : '', ok ? 'ok' : 'FAILED')));
-  }
-
-  const secondaryBody = { on: true, bri: brightness, seg: [{ fx: 0, col: [[color.r, color.g, color.b]] }] };
-  (settings.secondaryWledHosts || []).forEach((host) => {
-    tasks.push(sendToHost(host, secondaryBody).then((ok) => log('applyColor[' + host + ']', state, ok ? 'ok' : 'FAILED')));
+    if (settings.jobProgressEnabled && host === jobProgressHost && jobProgressActive) {
+      return Promise.resolve(true); // job progress owns this host right now
+    }
+    return sendToHost(host, { on: true, bri: brightness, seg: [{ fx: 0, col: [[color.r, color.g, color.b]] }] })
+      .then((ok) => log('applyColor[' + host + ']', state, ok ? 'ok' : 'FAILED'));
   });
 
   await Promise.all(tasks);
@@ -246,11 +320,7 @@ let lastKnownMachineState = {};
 function computeFollowerIndex(ratio) {
   if (settings.xFollowInvert) ratio = 1 - ratio;
   const ledCount = Math.max(1, settings.ledCount || 30);
-  const startOffset = Math.max(0, settings.followerStartOffset || 0);
-  const endOffset = Math.max(0, settings.followerEndOffset || 0);
-  const usableStart = Math.min(ledCount - 1, startOffset);
-  const usableEnd = Math.max(usableStart, ledCount - 1 - endOffset);
-  return Math.round(usableStart + ratio * (usableEnd - usableStart));
+  return Math.round(ratio * (ledCount - 1));
 }
 
 let idleSince = null;
@@ -292,9 +362,15 @@ async function handleServerState(payload) {
   const state = resolveDisplayState(merged);
   trackIdleTiming(state);
   let followerIndex = null;
-  if (settings.xFollowEnabled) {
-    const x = extractXPosition(merged);
-    if (typeof x === 'number') {
+  // Suppress the follower during homing: ncSender doesn't broadcast MPos
+  // while status is "Home" (confirmed via debug log), so the cursor would
+  // otherwise just freeze at its last known position - misleading, since
+  // it no longer reflects anything real. Show a solid homing color across
+  // the whole strip instead.
+  if (settings.xFollowEnabled && state !== 'homing') {
+    const rawX = extractXPosition(merged);
+    if (typeof rawX === 'number') {
+      const x = rawX + (settings.followerPositionOffsetMm || 0);
       const xMax = await getXMaxTravel();
       if (xMax) {
         const ratio = Math.max(0, Math.min(1, Math.abs(x) / xMax));
@@ -303,13 +379,32 @@ async function handleServerState(payload) {
     }
   }
 
+  // Determine job progress mode BEFORE applyColor, so the fan-out to
+  // jobProgressHost correctly skips (or includes) plain status color this
+  // same tick rather than lagging a tick behind.
+  const jobStatus = payload.jobLoaded && payload.jobLoaded.status;
+  const progressPercent = payload.jobLoaded && typeof payload.jobLoaded.progressPercent === 'number' ? payload.jobLoaded.progressPercent : null;
+  const jobProgressHost = (settings.jobProgressHost || '').trim();
+  const shouldShowProgress = !!(settings.jobProgressEnabled && jobProgressHost && jobStatus === 'running' && progressPercent != null);
+  if (shouldShowProgress !== jobProgressActive) {
+    jobProgressActive = shouldShowProgress;
+    lastJobProgressLit = null; // force a fresh send when switching modes
+  }
+
   if (state !== lastDisplayState || followerIndex !== lastFollowerIndex) {
     lastDisplayState = state;
     lastFollowerIndex = followerIndex;
     queueApplyColor(state, followerIndex).catch((err) => log('queueApplyColor error:', err.message));
   }
 
-  const jobStatus = payload.jobLoaded && payload.jobLoaded.status;
+  if (shouldShowProgress) {
+    const { litCount } = buildJobProgressSegments(progressPercent);
+    if (litCount !== lastJobProgressLit) {
+      lastJobProgressLit = litCount;
+      applyJobProgress(progressPercent).catch((err) => log('applyJobProgress error:', err.message));
+    }
+  }
+
   if (jobStatus) {
     if (lastJobStatus === 'running' && jobStatus === 'completed') {
       await playCompletionEffect();
@@ -345,7 +440,7 @@ function connect() {
 }
 
 async function main() {
-  log('starting — ncSender expected at ' + NCSENDER_HOST + ':' + NCSENDER_PORT);
+  log('starting — wled-status-bridge v' + BRIDGE_VERSION + ' — ncSender expected at ' + NCSENDER_HOST + ':' + NCSENDER_PORT);
   await refreshSettings();
   if (!settings) {
     log('WARNING: could not load plugin settings on startup — will keep retrying every ' + SETTINGS_REFRESH_MS + 'ms');
