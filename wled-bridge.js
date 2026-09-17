@@ -19,28 +19,46 @@
  *   1. npm install
  *   2. node wled-bridge.js
  *   (see README.md in this folder for running this automatically at login)
+ *
+ * Idle auto-off is owned exclusively by this bridge. The plugin dialog does
+ * not run its own idle timer — running two would race each other and
+ * double-send `{ on: false }` when both are active (the normal case).
  */
 
-const http = require('http');
-const path = require('path');
+import http from 'node:http';
+import { createRequire } from 'node:module';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';
 
-// Read the version directly from package.json rather than hardcoding it
-// here, so there's exactly one place it can ever drift from - and it's
-// printed on every startup so you can visually confirm which version is
-// actually running (vs. a stale download sitting around).
+import {
+  EFFECTS,
+  flattenStatePayload,
+  resolveDisplayState,
+  extractXPosition,
+  buildFollowerSegments,
+  buildPlainColorSegments,
+  buildJobProgressSegments,
+  computeFollowerIndex,
+  createSegmentTracker,
+  createJobLoadedTracker,
+  DEFAULT_STATE_COLORS
+} from './lib/wled-core.js';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const require = createRequire(import.meta.url);
+
 let BRIDGE_VERSION = 'unknown';
 try {
-  BRIDGE_VERSION = require(path.join(__dirname, 'package.json')).version || 'unknown';
-} catch (_) {
-  /* ignore - falls back to 'unknown' if package.json is missing/unreadable */
-}
+  BRIDGE_VERSION = JSON.parse(readFileSync(path.join(__dirname, 'package.json'), 'utf8')).version || 'unknown';
+} catch (_) {}
 
 let WebSocketImpl;
 try {
   WebSocketImpl = require('ws');
 } catch (_) {
   if (typeof WebSocket !== 'undefined') {
-    WebSocketImpl = WebSocket; // Node 22+ has a native global WebSocket client
+    WebSocketImpl = WebSocket;
   } else {
     console.error('No WebSocket implementation available. Run "npm install ws", or use Node.js 22+.');
     process.exit(1);
@@ -48,13 +66,22 @@ try {
 }
 
 const NCSENDER_HOST = process.env.NCSENDER_HOST || 'localhost';
-const NCSENDER_PORT = Number(process.env.NCSENDER_PORT) || 8090; // change if you set a custom "Remote Control Port" in ncSender
-const WLED_PORT = Number(process.env.WLED_PORT) || 80; // WLED normally listens on 80; override only for testing
+const NCSENDER_PORT = Number(process.env.NCSENDER_PORT) || 8090;
+const WLED_PORT = Number(process.env.WLED_PORT) || 80;
 const PLUGIN_ID = 'com.sparkstech.wledstatus';
 const SETTINGS_REFRESH_MS = 5000;
 const RECONNECT_DELAY_MS = 3000;
 
-const EFFECTS = { fireworks: 42, chase: 28, theaterchase: 11, colorloop: 8, strobe: 23 };
+// Verbose state + WLED traffic logging. Off by default because the state
+// handler runs on every server tick; set WLED_DEBUG=1 in the environment
+// to turn it on without editing this file.
+const DEBUG = /^(1|true|yes)$/i.test(process.env.WLED_DEBUG || '');
+const log = DEBUG ? function () { console.log(new Date().toISOString(), '[wled-bridge]', ...arguments); } : function () {};
+// Always-printed lines: lifecycle events worth seeing even in production,
+// so the bridge isn't silently dead when something goes wrong.
+function logAlways() { console.log(new Date().toISOString(), '[wled-bridge]', ...arguments); }
+
+const FALLBACK_COLORS = DEFAULT_STATE_COLORS;
 
 let settings = null;
 let lastDisplayState = null;
@@ -64,34 +91,64 @@ let celebrating = false;
 let cachedXMax = null;
 let wledRequestInFlight = false;
 let pendingApply = null;
+let jobProgressActive = false;
+let lastJobProgressLit = null;
 
-function log(...args) {
-  console.log(new Date().toISOString(), '[wled-bridge]', ...args);
+let lastKnownMachineState = {};
+const jobLoaded = createJobLoadedTracker();
+const segTracker = createSegmentTracker();
+
+function fetchJson(urlPath) {
+  return new Promise((resolve, reject) => {
+    http.get({ host: NCSENDER_HOST, port: NCSENDER_PORT, path: urlPath }, (res) => {
+      let body = '';
+      res.on('data', (chunk) => (body += chunk));
+      res.on('end', () => {
+        try { resolve(JSON.parse(body)); } catch (err) { reject(err); }
+      });
+    }).on('error', reject);
+  });
 }
 
-function fetchJson(path) {
-  return new Promise((resolve, reject) => {
-    http
-      .get({ host: NCSENDER_HOST, port: NCSENDER_PORT, path }, (res) => {
-        let body = '';
-        res.on('data', (chunk) => (body += chunk));
-        res.on('end', () => {
-          try {
-            resolve(JSON.parse(body));
-          } catch (err) {
-            reject(err);
-          }
-        });
-      })
-      .on('error', reject);
-  });
+function settingsEqual(a, b) {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  if (typeof a !== 'object' || typeof b !== 'object') return a === b;
+  const keysA = Object.keys(a);
+  const keysB = Object.keys(b);
+  if (keysA.length !== keysB.length) return false;
+  for (const k of keysA) {
+    const va = a[k], vb = b[k];
+    if (va && vb && typeof va === 'object' && typeof vb === 'object') {
+      if (!settingsEqual(va, vb)) return false;
+    } else if (va !== vb) {
+      return false;
+    }
+  }
+  return true;
 }
 
 async function refreshSettings() {
   try {
     const fresh = await fetchJson(`/api/plugins/${PLUGIN_ID}/settings`);
-    if (fresh && typeof fresh === 'object') settings = fresh;
+    if (fresh && typeof fresh === 'object') {
+      const prev = settings;
+      settings = fresh;
+      if (prev && !settingsEqual(prev, fresh)) {
+        jobProgressActive = false;
+        lastJobProgressLit = null;
+        lastDisplayState = null;
+        lastFollowerIndex = null;
+        cachedXMax = null;
+        segTracker.forget();
+        log('settings changed — reset derived state');
+      }
+    }
   } catch (err) {
+    // Connection failures are common enough at startup that spamming this
+    // every 5s would drown the console — log once per attempt only when
+    // DEBUG is on. The user will see the effect (nothing lights up) and
+    // check the log, at which point they'll turn WLED_DEBUG on.
     log('failed to load plugin settings (is ncSender running on port ' + NCSENDER_PORT + '?):', err.message);
   }
 }
@@ -116,10 +173,7 @@ function sendToHost(host, body) {
         }
       );
       req.on('error', () => resolve(false));
-      req.on('timeout', () => {
-        req.destroy();
-        resolve(false);
-      });
+      req.on('timeout', () => { req.destroy(); resolve(false); });
       req.write(data);
       req.end();
     } catch (_) {
@@ -130,40 +184,13 @@ function sendToHost(host, body) {
 
 function getAllHosts() {
   const hosts = [];
-  const primary = (settings.wledHost || '').trim();
+  const primary = (typeof settings.wledHost === 'string' ? settings.wledHost : '').trim();
   if (primary) hosts.push(primary);
-  // Tolerate both shapes: plain host strings (older saved settings, or if
-  // this REST read races ahead of the dialog's sanitized re-save) and the
-  // newer { host, name } objects.
   (settings.secondaryWledHosts || []).forEach((entry) => {
     const h = entry && typeof entry === 'object' ? entry.host : entry;
-    if (h && !hosts.includes(h)) hosts.push(h);
+    if (typeof h === 'string' && h && !hosts.includes(h)) hosts.push(h);
   });
   return hosts;
-}
-
-function resolveDisplayState(ms) {
-  if (!ms) return 'idle';
-  if (ms.isToolChanging) return 'tool-changing';
-  if (ms.isProbing) return 'probing';
-  const s = String(ms.status || 'idle').toLowerCase();
-  if (s === 'jog') return 'run';
-  if (s === 'home') return 'homing';
-  if (['run', 'hold', 'alarm', 'door', 'check'].includes(s)) return s;
-  return 'idle';
-}
-
-function extractXPosition(ms) {
-  const pos = ms && ms.MPos;
-  if (!pos) return null;
-  // Handle both the documented { x, y, z } shape and the comma-separated
-  // string actually observed on the wire ("x,y,z,a").
-  if (typeof pos === 'string') {
-    const parts = pos.split(',').map((p) => Number.parseFloat(p.trim()));
-    return Number.isFinite(parts[0]) ? parts[0] : null;
-  }
-  if (typeof pos === 'object' && Number.isFinite(pos.x)) return pos.x;
-  return null;
 }
 
 async function getXMaxTravel() {
@@ -174,113 +201,49 @@ async function getXMaxTravel() {
     const setting130 = data && data.settings && data.settings['130'];
     const value = setting130 ? Number.parseFloat(setting130.value) : null;
     if (value && value > 0) cachedXMax = value;
-  } catch (_) {
-    /* ignore, fall back to null */
-  }
+  } catch (_) {}
   return cachedXMax;
 }
 
-const FALLBACK_COLORS = {
-  idle: { r: 255, g: 255, b: 255 }, run: { r: 0, g: 255, b: 0 }, hold: { r: 255, g: 193, b: 7 },
-  alarm: { r: 255, g: 0, b: 0 }, door: { r: 253, g: 126, b: 20 }, check: { r: 0, g: 123, b: 255 },
-  probing: { r: 26, g: 188, b: 156 }, 'tool-changing': { r: 201, g: 18, b: 168 },
-  homing: { r: 0, g: 210, b: 255 }
-};
-
-// === Job progress bar ===
-// The job progress host shows the normal status color, like a secondary
-// instance, EXCEPT while a job is actively running - then it switches to
-// a fill bar instead. jobProgressActive tracks which mode it's currently
-// in, so applyColor() knows whether to skip sending status color to it.
-
-let jobProgressActive = false;
-let lastJobProgressLit = null;
-
-function interpolateColor(c1, c2, t) {
-  return {
-    r: Math.round(c1.r + (c2.r - c1.r) * t),
-    g: Math.round(c1.g + (c2.g - c1.g) * t),
-    b: Math.round(c1.b + (c2.b - c1.b) * t)
-  };
-}
-
-function buildJobProgressSegments(progressPercent) {
-  const ledCount = Math.max(1, settings.jobProgressLedCount || 30);
-  const ratio = Math.max(0, Math.min(1, (progressPercent || 0) / 100));
-  const litCount = Math.max(0, Math.min(ledCount, Math.round(ledCount * ratio)));
-  const bg = settings.jobProgressBackgroundColor || { r: 0, g: 0, b: 0 };
-  const startColor = settings.jobProgressStartColor || { r: 255, g: 0, b: 0 };
-  const endColor = settings.jobProgressEndColor || { r: 0, g: 255, b: 0 };
-  const fillColor = settings.jobProgressFillStyle === 'solid' ? startColor : interpolateColor(startColor, endColor, ratio);
-
-  const segments = [{ id: 0, start: 0, stop: ledCount, fx: 0, col: [[bg.r, bg.g, bg.b]] }];
-  if (litCount > 0) {
-    const start = settings.jobProgressInvert ? ledCount - litCount : 0;
-    const stop = settings.jobProgressInvert ? ledCount : litCount;
-    segments.push({ id: 1, start, stop, fx: 0, col: [[fillColor.r, fillColor.g, fillColor.b]] });
-  }
-  return { segments, litCount };
-}
-
 async function applyJobProgress(progressPercent) {
-  const host = (settings.jobProgressHost || '').trim();
+  const host = (typeof settings.jobProgressHost === 'string' ? settings.jobProgressHost : '').trim();
   if (!host) return;
-  const { segments } = buildJobProgressSegments(progressPercent);
-  const ok = await sendToHost(host, { on: true, bri: settings.brightness ?? 255, seg: segments });
+  const { segments } = buildJobProgressSegments(progressPercent, settings);
+  const finalSegments = segTracker.reconcile(host, segments);
+  const ok = await sendToHost(host, { on: true, bri: settings.brightness ?? 255, seg: finalSegments });
   log('applyJobProgress', progressPercent + '%', ok ? 'ok' : 'FAILED');
 }
 
-function buildFollowerSegments(color, followerIndex) {
-  const seg = [{ fx: 0, col: [[color.r, color.g, color.b]] }];
-  if (settings.xFollowEnabled && followerIndex != null) {
-    const width = Math.max(1, settings.followerWidth || 1);
-    const ledCount = Math.max(1, settings.ledCount || 30);
-    // Center the cursor on followerIndex rather than starting there.
-    const halfWidth = Math.floor(width / 2);
-    const start = Math.max(0, Math.min(ledCount - width, followerIndex - halfWidth));
-    const stop = Math.min(ledCount, start + width);
-    const fc = settings.followerColor || { r: 255, g: 255, b: 255 };
-    seg[0].id = 0;
-    seg[0].start = 0;
-    seg[0].stop = ledCount;
-    seg.push({ id: 1, start, stop, fx: 0, col: [[fc.r, fc.g, fc.b]] });
-  }
-  return seg;
-}
-
-// Applies the current state color to every configured host. Each host's
-// treatment depends on which exclusive role (if any) it's currently
-// assigned to: the follower host gets the cursor segments, the job
-// progress host gets skipped here entirely while a job is actively
-// showing its fill bar (applyJobProgress owns it during that window),
-// and every other host just gets the plain background color.
 async function applyColor(state, followerIndex) {
   const color = (settings.colors && settings.colors[state]) || FALLBACK_COLORS[state] || { r: 255, g: 255, b: 255 };
   const brightness = settings.brightness ?? 255;
-  const followerHost = (settings.followerHost || settings.wledHost || '').trim();
-  const jobProgressHost = (settings.jobProgressHost || '').trim();
+  const followerHost = (typeof settings.followerHost === 'string' && settings.followerHost.trim())
+    ? settings.followerHost.trim()
+    : (typeof settings.wledHost === 'string' ? settings.wledHost.trim() : '');
+  const jobProgressHost = (typeof settings.jobProgressHost === 'string' ? settings.jobProgressHost : '').trim();
 
   const tasks = getAllHosts().map((host) => {
     if (settings.xFollowEnabled && host === followerHost) {
-      return sendToHost(host, { on: true, bri: brightness, seg: buildFollowerSegments(color, followerIndex) })
+      const desired = buildFollowerSegments(color, followerIndex, settings);
+      return sendToHost(host, { on: true, bri: brightness, seg: segTracker.reconcile(host, desired) })
         .then((ok) => log('applyColor[follower:' + host + ']', state, followerIndex != null ? '(LED ' + followerIndex + ')' : '', ok ? 'ok' : 'FAILED'));
     }
     if (settings.jobProgressEnabled && host === jobProgressHost && jobProgressActive) {
-      return Promise.resolve(true); // job progress owns this host right now
+      return Promise.resolve(true);
     }
-    return sendToHost(host, { on: true, bri: brightness, seg: [{ fx: 0, col: [[color.r, color.g, color.b]] }] })
+    const ledCount = host === followerHost
+      ? (settings.ledCount || 30)
+      : host === jobProgressHost
+        ? (settings.jobProgressLedCount || 30)
+        : undefined;
+    const desired = buildPlainColorSegments(color, ledCount);
+    return sendToHost(host, { on: true, bri: brightness, seg: segTracker.reconcile(host, desired) })
       .then((ok) => log('applyColor[' + host + ']', state, ok ? 'ok' : 'FAILED'));
   });
 
   await Promise.all(tasks);
 }
 
-// Ensures at most one outbound request to WLED is ever in flight at once.
-// WLED's onboard web server (typically an ESP8266/ESP32) can't keep up with
-// rapid overlapping requests during continuous jogging - this coalesces
-// any state changes that arrive mid-request into just the latest one,
-// applied as soon as the current request finishes, instead of firing a
-// flood of concurrent requests that time out or get refused.
 async function queueApplyColor(state, followerIndex) {
   if (wledRequestInFlight) {
     pendingApply = { state, followerIndex };
@@ -303,8 +266,12 @@ async function playCompletionEffect() {
   celebrating = true;
   const fx = EFFECTS[settings.completionEffect] ?? EFFECTS.fireworks;
   log('job completed — playing', settings.completionEffect || 'fireworks');
-  const body = { on: true, bri: settings.brightness ?? 255, seg: [{ fx, sx: 180, ix: 200 }] };
-  await Promise.all(getAllHosts().map((host) => sendToHost(host, body)));
+  const body = (host) => ({
+    on: true,
+    bri: settings.brightness ?? 255,
+    seg: segTracker.reconcile(host, [{ id: 0, fx, sx: 180, ix: 200 }])
+  });
+  await Promise.all(getAllHosts().map((host) => sendToHost(host, body(host))));
 
   const durationMs = (settings.completionDurationSec ?? 6) * 1000;
   setTimeout(async () => {
@@ -315,21 +282,18 @@ async function playCompletionEffect() {
   }, durationMs);
 }
 
-let lastKnownMachineState = {};
-
-function computeFollowerIndex(ratio) {
-  if (settings.xFollowInvert) ratio = 1 - ratio;
-  const ledCount = Math.max(1, settings.ledCount || 30);
-  return Math.round(ratio * (ledCount - 1));
-}
-
+// Idle auto-off — owned exclusively by the bridge.
 let idleSince = null;
 let poweredOffForIdle = false;
 
 function trackIdleTiming(state) {
   if (state === 'idle') {
-    if (idleSince === null) idleSince = Date.now();
+    if (idleSince === null) {
+      idleSince = Date.now();
+      log('idle timer started (state=idle)');
+    }
   } else {
+    if (idleSince !== null) log('idle timer reset (state=' + state + ')');
     idleSince = null;
     poweredOffForIdle = false;
   }
@@ -338,35 +302,31 @@ function trackIdleTiming(state) {
 async function checkIdleTimeout() {
   if (!settings || !settings.idleOffMinutes || settings.idleOffMinutes <= 0) return;
   if (idleSince === null || poweredOffForIdle || celebrating) return;
-  const elapsedMs = Date.now() - idleSince;
-  if (elapsedMs >= settings.idleOffMinutes * 60000) {
+  if (Date.now() - idleSince >= settings.idleOffMinutes * 60000) {
     poweredOffForIdle = true;
     const hosts = getAllHosts();
     await Promise.all(hosts.map((h) => sendToHost(h, { on: false })));
-    log('idle timeout reached (' + settings.idleOffMinutes + ' min) — turned off ' + hosts.length + ' instance(s)');
+    logAlways('idle timeout reached (' + settings.idleOffMinutes + ' min) — turned off ' + hosts.length + ' instance(s)');
   }
 }
 
 async function handleServerState(payload) {
   if (!settings || celebrating) return;
-  const ms = payload && payload.machineState;
-  if (!ms) return;
+  const ms = flattenStatePayload(payload);
+  if (!ms || Object.keys(ms).length === 0) return;
 
-  // Real telemetry only includes a `status` field on some messages - mid-jog
-  // ticks often carry just MPos/WPos with no status at all. Merge into what
-  // we already knew so a position-only message doesn't wipe out the last
-  // known status.
   lastKnownMachineState = Object.assign({}, lastKnownMachineState, ms);
   const merged = lastKnownMachineState;
+  jobLoaded.merge(payload);
 
-  const state = resolveDisplayState(merged);
+  const jl = jobLoaded.get();
+  const jobStatus = (jl && jl.status) || merged.jobStatus || merged.senderStatus || null;
+
+  const state = resolveDisplayState(merged, jobStatus);
+  log('jobStatus resolved to:', jobStatus, '(state=' + state + ')');
   trackIdleTiming(state);
+
   let followerIndex = null;
-  // Suppress the follower during homing: ncSender doesn't broadcast MPos
-  // while status is "Home" (confirmed via debug log), so the cursor would
-  // otherwise just freeze at its last known position - misleading, since
-  // it no longer reflects anything real. Show a solid homing color across
-  // the whole strip instead.
   if (settings.xFollowEnabled && state !== 'homing') {
     const rawX = extractXPosition(merged);
     if (typeof rawX === 'number') {
@@ -374,21 +334,17 @@ async function handleServerState(payload) {
       const xMax = await getXMaxTravel();
       if (xMax) {
         const ratio = Math.max(0, Math.min(1, Math.abs(x) / xMax));
-        followerIndex = computeFollowerIndex(ratio);
+        followerIndex = computeFollowerIndex(ratio, settings);
       }
     }
   }
 
-  // Determine job progress mode BEFORE applyColor, so the fan-out to
-  // jobProgressHost correctly skips (or includes) plain status color this
-  // same tick rather than lagging a tick behind.
-  const jobStatus = payload.jobLoaded && payload.jobLoaded.status;
-  const progressPercent = payload.jobLoaded && typeof payload.jobLoaded.progressPercent === 'number' ? payload.jobLoaded.progressPercent : null;
-  const jobProgressHost = (settings.jobProgressHost || '').trim();
+  const progressPercent = jl && typeof jl.progressPercent === 'number' ? jl.progressPercent : null;
+  const jobProgressHost = (typeof settings.jobProgressHost === 'string' ? settings.jobProgressHost : '').trim();
   const shouldShowProgress = !!(settings.jobProgressEnabled && jobProgressHost && jobStatus === 'running' && progressPercent != null);
   if (shouldShowProgress !== jobProgressActive) {
     jobProgressActive = shouldShowProgress;
-    lastJobProgressLit = null; // force a fresh send when switching modes
+    lastJobProgressLit = null;
   }
 
   if (state !== lastDisplayState || followerIndex !== lastFollowerIndex) {
@@ -398,7 +354,7 @@ async function handleServerState(payload) {
   }
 
   if (shouldShowProgress) {
-    const { litCount } = buildJobProgressSegments(progressPercent);
+    const { litCount } = buildJobProgressSegments(progressPercent, settings);
     if (litCount !== lastJobProgressLit) {
       lastJobProgressLit = litCount;
       applyJobProgress(progressPercent).catch((err) => log('applyJobProgress error:', err.message));
@@ -416,7 +372,7 @@ async function handleServerState(payload) {
 function connect() {
   const ws = new WebSocketImpl(`ws://${NCSENDER_HOST}:${NCSENDER_PORT}`);
 
-  ws.addEventListener('open', () => log('connected to ncSender WebSocket at ' + NCSENDER_HOST + ':' + NCSENDER_PORT));
+  ws.addEventListener('open', () => logAlways('connected to ncSender WebSocket at ' + NCSENDER_HOST + ':' + NCSENDER_PORT));
 
   ws.addEventListener('message', (event) => {
     let msg;
@@ -432,7 +388,7 @@ function connect() {
   });
 
   ws.addEventListener('close', () => {
-    log('WebSocket closed, reconnecting in ' + RECONNECT_DELAY_MS + 'ms');
+    logAlways('WebSocket closed, reconnecting in ' + RECONNECT_DELAY_MS + 'ms');
     setTimeout(connect, RECONNECT_DELAY_MS);
   });
 
@@ -440,11 +396,14 @@ function connect() {
 }
 
 async function main() {
-  log('starting — wled-status-bridge v' + BRIDGE_VERSION + ' — ncSender expected at ' + NCSENDER_HOST + ':' + NCSENDER_PORT);
+  logAlways('starting — wled-status-bridge v' + BRIDGE_VERSION + ' — ncSender expected at ' + NCSENDER_HOST + ':' + NCSENDER_PORT);
+  logAlways('verbose logging ' + (DEBUG ? 'ON (WLED_DEBUG=1)' : 'off (set WLED_DEBUG=1 to enable)'));
+
   await refreshSettings();
   if (!settings) {
-    log('WARNING: could not load plugin settings on startup — will keep retrying every ' + SETTINGS_REFRESH_MS + 'ms');
+    logAlways('WARNING: could not load plugin settings on startup — will keep retrying every ' + SETTINGS_REFRESH_MS + 'ms');
   }
+
   setInterval(refreshSettings, SETTINGS_REFRESH_MS);
   setInterval(() => { checkIdleTimeout().catch((err) => log('checkIdleTimeout error:', err.message)); }, 30000);
   connect();

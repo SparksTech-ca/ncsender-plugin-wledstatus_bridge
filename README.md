@@ -38,7 +38,7 @@ Two settings work identically here and in the dialog:
    ```
 4. You should see:
    ```
-   2026-08-27T... [wled-bridge] starting — wled-status-bridge v1.4.2 — ncSender expected at localhost:8090
+   2026-08-27T... [wled-bridge] starting — wled-status-bridge v1.6.2 — ncSender expected at localhost:8090
    2026-08-27T... [wled-bridge] connected to ncSender WebSocket at localhost:8090
    ```
 5. Jog the machine — the console should print `applyColor run ok`, `applyColor idle ok`, etc. as the state changes, and the WLED strip should follow along, with ncSender's own dialog completely closed.
